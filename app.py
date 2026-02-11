@@ -149,5 +149,12 @@ with tab1:
             st.warning("Connect to Monday.com first.")
 
 with tab2:
+    st.subheader("📋 Work Orders Board")
     if st.session_state.wo_df is not None:
         st.dataframe(st.session_state.wo_df)
+    
+    st.markdown("---") # Separator line
+    
+    st.subheader("🤝 Deals Board")
+    if st.session_state.deal_df is not None:
+        st.dataframe(st.session_state.deal_df)
