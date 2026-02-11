@@ -7,35 +7,33 @@ from openai import OpenAI
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Skylark BI Agent", layout="wide", page_icon="🚁")
 
-# --- CSS FOR PROFESSIONAL LOOK ---
+# --- CSS ---
 st.markdown("""
 <style>
     .main-header {font-size: 2.5rem; color: #1E1E1E;}
-    .sub-header {font-size: 1.5rem; color: #4A4A4A;}
-    .metric-card {background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 5px solid #ff4b4b;}
+    .metric-card {background-color: #f0f2f6; padding: 20px; border-radius: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🚁 Skylark Drones Executive Agent</div>', unsafe_allow_html=True)
 
-# --- SIDEBAR: CONFIGURATION ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuration")
     MONDAY_API_KEY = st.text_input("Monday API Key", type="password")
-    OPENAI_API_KEY = st.text_input("OpenAI API Key", type="password")
+    
+    # CHANGED LABEL TO GROQ
+    GROQ_API_KEY = st.text_input("Groq API Key (Free)", type="password")
+    
     WO_BOARD_ID = st.text_input("Work Orders Board ID")
     DEALS_BOARD_ID = st.text_input("Deals Board ID")
-    
     st.markdown("---")
-    load_btn = st.button("🔄 Sync with Monday.com", type="primary")
-    
-    st.info("💡 **Tip:** Use the 'Leadership Briefing' button for a one-click executive update.")
+    load_btn = st.button("🔄 Sync Data", type="primary")
 
-# --- MODULE: MONDAY.COM INTEGRATION ---
+# --- FETCH DATA ---
 def fetch_board_data(board_id, api_key):
     url = "https://api.monday.com/v2"
     headers = {"Authorization": api_key, "API-Version": "2023-10"}
-    
     query = f"""
     query {{
       boards (ids: {board_id}) {{
@@ -55,8 +53,7 @@ def fetch_board_data(board_id, api_key):
         response = requests.post(url, json={'query': query}, headers=headers)
         if response.status_code == 200:
             data = response.json()
-            if 'errors' in data:
-                return pd.DataFrame(), f"GraphQL Error: {data['errors'][0]['message']}"
+            if 'errors' in data: return pd.DataFrame(), str(data['errors'])
             
             items = data['data']['boards'][0]['items_page']['items']
             rows = []
@@ -67,180 +64,130 @@ def fetch_board_data(board_id, api_key):
                         row[col['column']['title']] = col['text']
                 rows.append(row)
             return pd.DataFrame(rows), None
-        else:
-            return pd.DataFrame(), f"HTTP Error: {response.status_code}"
+        return pd.DataFrame(), "API Error"
     except Exception as e:
         return pd.DataFrame(), str(e)
 
-# --- MODULE: DATA RESILIENCE & CLEANING ---
+# --- CLEAN DATA ---
 def process_data(df):
     if df.empty: return df
     
-    # 1. Normalize Text (Handle messy casing)
-    cols_to_normalize = ['Sector', 'Status', 'Deal Stage', 'Execution Status']
+    # Clean Numeric Columns
     for col in df.columns:
-        for target in cols_to_normalize:
-            if target in col:
-                df[col] = df[col].astype(str).str.strip().str.title()
-
-    # 2. Handle Numeric & Currency
-    for col in df.columns:
-        if any(x in col.lower() for x in ['amount', 'price', 'value', 'billed', 'collected']):
-            # Remove symbols, handle "Masked" values by coercing to NaN
+        col_lower = col.lower()
+        if any(x in col_lower for x in ['amount', 'price', 'value', 'budget', 'masked']):
+            # Remove currency symbols, commas, and handle "Masked" text
             df[col] = df[col].astype(str).str.replace(r'[^\d.-]', '', regex=True)
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    # 3. Handle Dates
-    for col in df.columns:
-        if 'date' in col.lower():
-            df[col] = pd.to_datetime(df[col], errors='coerce')
             
     return df
 
-# --- MODULE: INTELLIGENCE ENGINE ---
+# --- AI ENGINE (GROQ VERSION) ---
 def ask_analyst(query, df_wo, df_deals, api_key, is_briefing=False):
-    client = OpenAI(api_key=api_key)
+    # SWITCH TO GROQ CLIENT
+    client = OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=api_key
+    )
     
-    # Create lightweight context
-    # We limit to first 100 rows to avoid token limits if data is huge
-    wo_context = df_wo.head(100).to_csv(index=False)
-    deal_context = df_deals.head(100).to_csv(index=False)
+    # Truncate context
+    wo_context = df_wo.head(50).to_csv(index=False)
+    deal_context = df_deals.head(50).to_csv(index=False)
     
-    # specialized prompt for leadership updates vs normal queries
-    if is_briefing:
-        role_instruction = """
-        You are the Chief of Staff preparing a **Leadership Update Memo**.
-        Format your response as follows:
-        1. **Executive Summary**: 3 bullet points on overall health.
-        2. **Revenue Pulse**: Billed vs. Collected (Cash Flow).
-        3. **Pipeline Radar**: High probability deals closing soon.
-        4. **Risk Watch**: Projects marked "Stuck", "On Hold", or with massive outstanding balances.
-        """
-    else:
-        role_instruction = """
-        You are a Senior BI Analyst. Answer the user's specific question.
-        - If data is "Masked" or 0, explicitly mention this as a data quality caveat.
-        - Normalize sectors (e.g., treat "Mining" and "mining" as the same).
-        - If the user asks for a chart, provide the data in a table format so I can plot it.
-        """
-
+    role_desc = "Chief of Staff" if is_briefing else "Senior BI Analyst"
+    
     system_prompt = f"""
-    {role_instruction}
+    You are the {role_desc} at Skylark Drones.
     
     DATA CONTEXT:
-    --- WORK ORDERS (Project Execution) ---
-    {wo_context}
+    1. WORK ORDERS: {wo_context}
+    2. DEALS: {deal_context}
     
-    --- DEALS (Sales Pipeline) ---
-    {deal_context}
-    
-    Refuse to answer non-business questions.
+    INSTRUCTIONS:
+    - If the user asks for a Leadership Update, provide: Executive Summary, Revenue Pulse, and Risk Watch.
+    - Note that 'Masked' values in data are treated as 0 or missing. Mention this caveat.
+    - Keep answers professional and concise.
     """
-
+    
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini", # CHANGED FROM gpt-4 to gpt-4o-mini
+            # USING FREE LLAMA 3 MODEL
+            model="llama3-8b-8192", 
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": query}
-            ],
-            temperature=0.1
+            ]
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"AI Error: {e}"
+        return f"Groq API Error: {str(e)}"
 
 # --- MAIN LOGIC ---
-
-# Session State Initialization
 if 'wo_data' not in st.session_state: st.session_state.wo_data = None
 if 'deal_data' not in st.session_state: st.session_state.deal_data = None
 
-# Data Loading Logic
-if load_btn:
-    if not (MONDAY_API_KEY and WO_BOARD_ID and DEALS_BOARD_ID):
-        st.error("❌ Please provide all Credentials.")
-    else:
-        with st.spinner("📡 Connecting to Monday.com..."):
-            wo_raw, err1 = fetch_board_data(WO_BOARD_ID, MONDAY_API_KEY)
-            deal_raw, err2 = fetch_board_data(DEALS_BOARD_ID, MONDAY_API_KEY)
-            
-            if err1 or err2:
-                st.error(f"Connection Failed: {err1 or err2}")
-            else:
-                st.session_state.wo_data = process_data(wo_raw)
-                st.session_state.deal_data = process_data(deal_raw)
-                st.success(f"✅ Synced {len(st.session_state.wo_data)} Work Orders & {len(st.session_state.deal_data)} Deals")
+if load_btn and MONDAY_API_KEY:
+    with st.spinner("Fetching..."):
+        wo, err1 = fetch_board_data(WO_BOARD_ID, MONDAY_API_KEY)
+        deals, err2 = fetch_board_data(DEALS_BOARD_ID, MONDAY_API_KEY)
+        
+        st.session_state.wo_data = process_data(wo)
+        st.session_state.deal_data = process_data(deals)
+        
+        if not wo.empty: st.success("Data Synced!")
 
-# UI Layout
 if st.session_state.wo_data is not None:
+    wo = st.session_state.wo_data
+    deals = st.session_state.deal_data
     
-    wo_df = st.session_state.wo_data
-    deal_df = st.session_state.deal_data
+    # --- METRICS ---
+    rev_col = next((c for c in wo.columns if "incl" in c.lower() and "amount" in c.lower()), None)
+    total_rev = wo[rev_col].sum() if rev_col else 0
     
-    # Calculate Totals
-    total_rev = 0
-    # Find likely revenue column
-    rev_col = next((c for c in wo_df.columns if "amount" in c.lower() and "incl" in c.lower()), None)
-    if rev_col:
-        total_rev = wo_df[rev_col].sum()
+    pipe_col = next((c for c in deals.columns if "value" in c.lower()), None)
+    total_pipe = deals[pipe_col].sum() if pipe_col else 0
 
-    total_pipeline = 0
-    # Find likely pipeline value column
-    pipe_col = next((c for c in deal_df.columns if "value" in c.lower()), None)
-    if pipe_col:
-        total_pipeline = deal_df[pipe_col].sum()
-
-    # Top Stats Bar
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Active Projects", len(wo_df))
-    col2.metric("Pipeline Deals", len(deal_df))
-    col3.metric("Total Pipeline Value", f"₹{total_pipeline:,.0f}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Active Projects", len(wo))
+    c2.metric("Pipeline Deals", len(deals))
+    c3.metric("Est. Pipeline Value", f"₹{total_pipe:,.0f}")
     
     st.divider()
-
-    # Main Interaction Area
-    tab1, tab2, tab3 = st.tabs(["🤖 Analyst Agent", "📊 Visuals", "📂 Raw Data"])
     
-    with tab1:
-        st.subheader("Business Intelligence Query")
-        col_q, col_btn = st.columns([4, 1])
+    t1, t2, t3 = st.tabs(["🤖 Analyst", "📊 Visuals", "📂 Data"])
+    
+    with t1:
+        q = st.text_area("Ask a question:", height=100)
+        c_act, c_b = st.columns([1, 4])
         
-        user_query = col_q.text_area("Ask a question about the business:", height=100, placeholder="e.g., Which sector has the highest outstanding receivables?")
-        
-        # Space for buttons
-        b1 = col_btn.button("Analyze", use_container_width=True)
-        b2 = col_btn.button("📝 Leadership Briefing", use_container_width=True, type="primary")
-        
-        if b1 or b2:
-            if not OPENAI_API_KEY:
-                st.error("Please enter OpenAI API Key.")
+        # NOTE: WE USE GROQ_API_KEY HERE
+        if c_act.button("Analyze"):
+            if not GROQ_API_KEY:
+                st.error("Missing Groq Key")
             else:
-                prompt = "Generate a leadership update." if b2 else user_query
-                with st.spinner("Analyzing data..."):
-                    response = ask_analyst(prompt, wo_df, deal_df, OPENAI_API_KEY, is_briefing=b2)
-                    st.markdown("### 📋 Insights")
-                    st.markdown(response)
-
-    with tab2:
-        st.subheader("Sector Performance Analysis")
-        # Try to find Sector and Amount columns automatically
-        sector_col = next((c for c in wo_df.columns if 'sector' in c.lower()), None)
-        amount_col = next((c for c in wo_df.columns if 'amount' in c.lower()), None)
+                with st.spinner("Thinking (Llama 3)..."):
+                    res = ask_analyst(q, wo, deals, GROQ_API_KEY)
+                    st.markdown(res)
         
-        if sector_col and amount_col:
-            chart_data = wo_df.groupby(sector_col)[amount_col].sum().reset_index()
-            fig = px.bar(chart_data, x=sector_col, y=amount_col, title="Revenue by Sector", color=sector_col)
+        if c_b.button("📝 Generate Leadership Briefing"):
+             if not GROQ_API_KEY:
+                st.error("Missing Groq Key")
+             else:
+                with st.spinner("Writing Briefing..."):
+                    res = ask_analyst("Leadership Update", wo, deals, GROQ_API_KEY, is_briefing=True)
+                    st.markdown(res)
+
+    with t2:
+        st.subheader("Sector Performance")
+        sec_col = next((c for c in wo.columns if "sector" in c.lower()), None)
+        
+        if sec_col and rev_col:
+            df_chart = wo.groupby(sec_col)[rev_col].sum().reset_index()
+            fig = px.bar(df_chart, x=sec_col, y=rev_col, title="Revenue by Sector", color=sec_col)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Could not automatically determine Sector or Amount columns for the chart.")
+            st.warning("Data mismatch for charts.")
 
-    with tab3:
-        st.subheader("Work Orders Board")
-        st.dataframe(wo_df)
-        st.markdown("---")
-        st.subheader("Deals Board")
-        st.dataframe(deal_df)
-
-else:
-    st.info("👈 Please enter your API keys and connect in the sidebar to begin.")
+    with t3:
+        st.dataframe(wo)
+        st.dataframe(deals)
